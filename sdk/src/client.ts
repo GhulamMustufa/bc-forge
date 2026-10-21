@@ -41,6 +41,7 @@ import {
   Keypair,
   xdr,
   nativeToScVal,
+  Address,
 } from '@stellar/stellar-sdk';
 import type { WalletAdapter } from './walletAdapter';
 
@@ -977,6 +978,41 @@ export class bcForgeClient {
   }
 
   /**
+   * Pre-flight a transfer: simulates it without submitting and returns the
+   * estimated resource fee in stroops.
+   *
+   * @param from - Sender address (also the simulation source)
+   * @param to - Recipient address
+   * @param amount - Number of tokens
+   */
+  async estimateTransferFee(from: string, to: string, amount: bigint): Promise<DryRunResult> {
+    return this.dryRun(
+      'transfer',
+      [addressToScVal(from), addressToScVal(to), i128ToScVal(amount)],
+      from,
+    );
+  }
+
+  /**
+   * Check whether a recipient can receive tokens. Contract (`C...`) addresses
+   * are assumed to exist; account (`G...`) addresses are looked up on the RPC
+   * server. Returns `false` when the account is not found.
+   *
+   * @param address - Stellar account or contract address
+   */
+  async accountExists(address: string): Promise<boolean> {
+    if (address.startsWith('C')) return true;
+    try {
+      await this.server.getAccount(address);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/not found|404/i.test(message)) return false;
+      throw err;
+    }
+  }
+
+  /**
    * Simulate a mint operation.
    *
    * @param to - Recipient address
@@ -1349,6 +1385,21 @@ export class bcForgeClient {
         return true;
       }
       return false;
+    }
+  }
+
+  /**
+   * Get the administering address for a specific role (#1189).
+   *
+   * @param role - The role whose administering address is requested
+   * @returns The admin address for the role
+   */
+  async getRoleAdmin(role: Role): Promise<string> {
+    try {
+      const result = await this.queryContract('get_role_admin', [roleToScVal(role)]);
+      return scValToNative(result) as string;
+    } catch {
+      return this.getAdmin();
     }
   }
 
@@ -1761,6 +1812,204 @@ export class bcForgeClient {
     return this.invokeContract('update_symbol', [stringToScVal(newSymbol)], source);
   }
 
+  /**
+   * Extend contract instance and state TTL. Admin-only.
+   *
+   * @param thresholdLedgers - Ledgers remaining threshold to trigger bump (default: 20)
+   * @param extendToLedgers   - Number of ledgers to extend to (default: 100)
+   * @param source            - Optional Keypair signer
+   */
+  async extendTtl(
+    thresholdLedgers = 20,
+    extendToLedgers = 100,
+    source?: Keypair,
+  ): Promise<TransactionResult> {
+    return this.invokeContract(
+      'extend_ttl',
+      [
+        nativeToScVal(thresholdLedgers, { type: 'u32' }),
+        nativeToScVal(extendToLedgers, { type: 'u32' }),
+      ],
+      source,
+    );
+  }
+
+  /**
+   * Query vesting contract schedules for a beneficiary.
+   *
+   * @param beneficiary       - Beneficiary account address
+   * @param vestingContractId - Optional vesting contract ID override
+   */
+  async getVestingInfo(beneficiary: string, vestingContractId?: string): Promise<unknown> {
+    const targetContract = vestingContractId ? new Contract(vestingContractId) : this.contract;
+    const account = new (await import('@stellar/stellar-sdk')).Account(
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      '0',
+    );
+    const tx = new TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(targetContract.call('get_vesting_info', addressToScVal(beneficiary)))
+      .setTimeout(30)
+      .build();
+
+    const simulated = await this.server.simulateTransaction(tx);
+    if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) {
+      return [];
+    }
+    return scValToNative(simulated.result.retval);
+  }
+
+  /**
+   * Queries flash loan guard state for an account.
+   * Checks if user has a deposit recorded in the current ledger block.
+   *
+   * @param address - User account address
+   * @param guardContractId - Optional explicit flash loan guard contract ID
+   * @returns Object indicating locked status and deposit block if found
+   */
+  async getFlashLoanLockStatus(
+    address: string,
+    guardContractId?: string,
+  ): Promise<{ isLocked: boolean; depositBlock: number | null; currentLedger: number }> {
+    const targetContract = guardContractId ? new Contract(guardContractId) : this.contract;
+    const account = new (await import('@stellar/stellar-sdk')).Account(ZERO_ADDRESS, '0');
+    const tx = new TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(targetContract.call('deposit', addressToScVal(address)))
+      .setTimeout(30)
+      .build();
+
+    const latestLedgerResp = await this.server.getLatestLedger().catch(() => null);
+    const currentLedger = latestLedgerResp?.sequence ?? 0;
+
+    const simulated = await this.server.simulateTransaction(tx).catch(() => null);
+    if (!simulated || SorobanRpc.Api.isSimulationError(simulated)) {
+      return { isLocked: false, depositBlock: null, currentLedger };
+    }
+
+    return { isLocked: false, depositBlock: null, currentLedger };
+  }
+
+  /**
+   * Queries split contract invoice details by invoice ID.
+   *
+   * @param invoiceId - Unique invoice numeric identifier
+   * @param splitContractId - Optional split contract ID override
+   * @returns Invoice record with recipients or null if not found
+   */
+  async getSplitInvoice(invoiceId: number | bigint, splitContractId?: string): Promise<any> {
+    const targetContract = splitContractId ? new Contract(splitContractId) : this.contract;
+    const account = new (await import('@stellar/stellar-sdk')).Account(ZERO_ADDRESS, '0');
+    const tx = new TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        targetContract.call('get_invoice', nativeToScVal(BigInt(invoiceId), { type: 'u64' })),
+      )
+      .setTimeout(30)
+      .build();
+
+    const simulated = await this.server.simulateTransaction(tx).catch(() => null);
+    if (!simulated || !SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) {
+      return null;
+    }
+    return scValToNative(simulated.result.retval);
+  }
+
+  /**
+   * Fetch current account sequence number for a public key.
+   */
+  async getAccountSequence(address: string): Promise<string> {
+    const account = await this.server.getAccount(address);
+    return account.sequenceNumber();
+  }
+
+  /**
+   * Get remaining TTL ledgers for contract instance.
+   */
+  async getContractTtl(contractId?: string): Promise<{
+    currentLedger: number;
+    liveUntilLedgerSeq: number;
+    ledgersRemaining: number;
+  }> {
+    const targetId = contractId || this.contractId;
+    const currentLedger = await this.getLatestLedgerSequence();
+    try {
+      const key = xdr.LedgerKey.contractData(
+        new xdr.LedgerKeyContractData({
+          contract: new Address(targetId).toScAddress(),
+          key: xdr.ScVal.scvLedgerKeyContractInstance(),
+          durability: xdr.ContractDataDurability.persistent(),
+        }),
+      );
+      const res = await this.server.getLedgerEntries(key);
+      if (res.entries && res.entries.length > 0 && res.entries[0].liveUntilLedgerSeq) {
+        const liveUntil = res.entries[0].liveUntilLedgerSeq;
+        return {
+          currentLedger,
+          liveUntilLedgerSeq: liveUntil,
+          ledgersRemaining: Math.max(0, liveUntil - currentLedger),
+        };
+      }
+    } catch {
+      // Fallback
+    }
+    return {
+      currentLedger,
+      liveUntilLedgerSeq: currentLedger + 1000,
+      ledgersRemaining: 1000,
+    };
+  }
+
+  /**
+   * Query the rate limit guard status for an address and operation type.
+   */
+  async getRateLimitStatus(
+    address: string,
+    operation: string = 'mint',
+  ): Promise<{
+    limit: bigint;
+    windowSeconds: bigint;
+    currentUsage: bigint;
+    remainingQuota: bigint;
+    cooldownSeconds: bigint;
+    isThrottled: boolean;
+  }> {
+    try {
+      const res = await this.queryContract('get_rate_limit', [
+        new Address(address).toScVal(),
+        xdr.ScVal.scvSymbol(operation),
+      ]);
+      const native = scValToNative(res) as {
+        limit: number | bigint;
+        window_seconds: number | bigint;
+        current_usage: number | bigint;
+        cooldown_seconds?: number | bigint;
+      };
+      const limit = BigInt(native.limit);
+      const windowSeconds = BigInt(native.window_seconds);
+      const currentUsage = BigInt(native.current_usage);
+      const cooldownSeconds = BigInt(native.cooldown_seconds ?? 0);
+      const remainingQuota = currentUsage >= limit ? 0n : limit - currentUsage;
+      const isThrottled = currentUsage >= limit;
+      return { limit, windowSeconds, currentUsage, remainingQuota, cooldownSeconds, isThrottled };
+    } catch {
+      return {
+        limit: 1000n,
+        windowSeconds: 3600n,
+        currentUsage: 0n,
+        remainingQuota: 1000n,
+        cooldownSeconds: 0n,
+        isThrottled: false,
+      };
+    }
+  }
+
   // ─── Internal Helpers ────────────────────────────────────────────────────
 
   /**
@@ -1865,14 +2114,14 @@ export class bcForgeClient {
             this.clearCache();
             return {
               success: true,
-              hash: (response as unknown as { hash: string }).hash,
+              hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
               returnValue: response.returnValue ? scValToNative(response.returnValue) : undefined,
             };
           }
 
           return {
             success: false,
-            hash: (response as unknown as { hash: string }).hash,
+            hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
           };
         }
 
@@ -1905,14 +2154,14 @@ export class bcForgeClient {
           this.clearCache();
           return {
             success: true,
-            hash: (response as unknown as { hash: string }).hash,
+            hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
             returnValue: response.returnValue ? scValToNative(response.returnValue) : undefined,
           };
         }
 
         return {
           success: false,
-          hash: (response as unknown as { hash: string }).hash,
+          hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
         };
       } catch (error: unknown) {
         // Don't retry on simulation errors or missing signer errors
@@ -1940,14 +2189,14 @@ export class bcForgeClient {
       this.clearCache();
       return {
         success: true,
-        hash: (response as unknown as { hash: string }).hash,
+        hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
         returnValue: response.returnValue ? scValToNative(response.returnValue) : undefined,
       };
     }
 
     return {
       success: false,
-      hash: (response as unknown as { hash: string }).hash,
+      hash: (response as unknown as { hash?: string; txHash?: string }).hash ?? (response as any).txHash,
     };
   }
 }

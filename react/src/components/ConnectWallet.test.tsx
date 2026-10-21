@@ -48,6 +48,12 @@ jest.mock('@bc-forge/sdk', () => {
     }
   }
   return {
+    Role: {
+      Admin: 'Admin',
+      SuperAdmin: 'SuperAdmin',
+      Minter: 'Minter',
+      Pauser: 'Pauser',
+    },
     bcForgeClient: jest.fn().mockImplementation(() => ({
       setWalletAdapter: mockSetWalletAdapter,
     })),
@@ -87,6 +93,11 @@ const renderConnected = () =>
 describe('ConnectWallet', () => {
   beforeEach(() => {
     mockSetWalletAdapter.mockClear();
+    // A successful connect persists the wallet so a reload can restore it
+    // (#1172), and jsdom keeps one `localStorage` for the whole file. A session
+    // left by an earlier test would be silently reconnected on mount and push
+    // `setWalletAdapter` past the single-call assertions below.
+    localStorage.clear();
   });
 
   it('calls client.setWalletAdapter with the Freighter adapter and exposes the public key', async () => {
@@ -99,9 +110,10 @@ describe('ConnectWallet', () => {
     });
 
     expect(mockSetWalletAdapter).toHaveBeenCalledTimes(1);
-    const adapter = mockSetWalletAdapter.mock.calls[0][0];
-    expect(adapter.name).toBe('freighter');
-    expect(adapter.publicKey).toBe(FREIGHTER_KEY);
+    const [firstCall] = mockSetWalletAdapter.mock.calls;
+    const adapter = firstCall?.[0];
+    expect(adapter?.name).toBe('freighter');
+    expect(adapter?.publicKey).toBe(FREIGHTER_KEY);
 
     expect(screen.getByTestId('probe-name')).toHaveTextContent('freighter');
     expect(screen.getByTestId('probe-pubkey')).toHaveTextContent(FREIGHTER_KEY);
@@ -120,9 +132,10 @@ describe('ConnectWallet', () => {
     });
 
     expect(mockSetWalletAdapter).toHaveBeenCalledTimes(1);
-    const adapter = mockSetWalletAdapter.mock.calls[0][0];
-    expect(adapter.name).toBe('albedo');
-    expect(adapter.publicKey).toBe(ALBEDO_KEY);
+    const [firstCall] = mockSetWalletAdapter.mock.calls;
+    const adapter = firstCall?.[0];
+    expect(adapter?.name).toBe('albedo');
+    expect(adapter?.publicKey).toBe(ALBEDO_KEY);
 
     expect(screen.getByTestId('probe-name')).toHaveTextContent('albedo');
     expect(screen.getByTestId('probe-pubkey')).toHaveTextContent(ALBEDO_KEY);
@@ -144,5 +157,46 @@ describe('ConnectWallet', () => {
 
     expect(mockSetWalletAdapter).toHaveBeenLastCalledWith(undefined);
     expect(screen.getByTestId('probe-pubkey')).toHaveTextContent('none');
+  });
+
+  it('displays prominent warning banner identifying expected vs actual network passphrases (#1175)', async () => {
+    class MismatchedFreighterAdapter {
+      name = 'freighter';
+      connected = false;
+      publicKey?: string;
+      networkPassphrase = 'Public Global Stellar Network ; September 2015';
+      async connect() {
+        this.publicKey = FREIGHTER_KEY;
+        this.connected = true;
+      }
+      async disconnect() {}
+      async signTransaction(xdr: string) {
+        return xdr;
+      }
+    }
+
+    render(
+      <BcForgeProvider config={config}>
+        <WalletProvider
+          adapterFactories={{
+            freighter: () => new MismatchedFreighterAdapter() as any,
+          }}
+        >
+          <ConnectWallet />
+        </WalletProvider>
+      </BcForgeProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId('connect-freighter'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('network-mismatch-warning')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('network-mismatch-warning')).toHaveTextContent(
+      /Test SDF Network ; September 2015/,
+    );
+    expect(screen.getByTestId('network-mismatch-warning')).toHaveTextContent(
+      /Public Global Stellar Network ; September 2015/,
+    );
   });
 });
